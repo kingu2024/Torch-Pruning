@@ -54,6 +54,7 @@ from train_seg import (
     SegDataset, evaluate, compute_miou, build_model,
     PRESET_MODELS, MODEL_DICT, BACKBONE_REGISTRY, NECK_REGISTRY, HEAD_REGISTRY,
 )
+from losses import MultiSegLoss
 
 
 def get_logger(name, log_file=None):
@@ -149,8 +150,20 @@ def progressive_pruning(pruner, model, speed_up, example_inputs):
     return current_speed_up
 
 
+def build_criterion(args, device):
+    """Build the multi-loss criterion from CLI arguments."""
+    return MultiSegLoss(
+        num_classes=args.num_classes,
+        ce_weight=args.ce_weight,
+        edge_weight=args.edge_weight,
+        lovasz_weight=args.lovasz_weight,
+        ignore_index=255,
+    ).to(device)
+
+
 def sparsity_learning(model, pruner, train_loader, args, logger, device):
     """Run sparsity learning (regularization) phase before pruning."""
+    criterion = build_criterion(args, device)
     optimizer = torch.optim.SGD(
         model.parameters(), lr=args.sl_lr, momentum=0.9,
         weight_decay=0,
@@ -165,15 +178,17 @@ def sparsity_learning(model, pruner, train_loader, args, logger, device):
             images, masks = images.to(device), masks.to(device)
             optimizer.zero_grad()
             output = model(images)
-            loss = F.cross_entropy(output["out"], masks, ignore_index=255)
+            loss, loss_dict = criterion(output["out"], masks)
             loss.backward()
             pruner.regularize(model)
             optimizer.step()
 
             if (i + 1) % args.log_interval == 0:
+                loss_info = " ".join(f"{k}={v:.4f}" for k, v in loss_dict.items())
                 logger.info(
-                    "  [Sparsity Learning] Epoch [%d/%d] Iter [%d/%d] Loss: %.4f",
-                    epoch + 1, args.sl_epochs, i + 1, len(train_loader), loss.item(),
+                    "  [Sparsity Learning] Epoch [%d/%d] Iter [%d/%d] Loss: %.4f (%s)",
+                    epoch + 1, args.sl_epochs, i + 1, len(train_loader),
+                    loss.item(), loss_info,
                 )
 
         if isinstance(pruner, tp.pruner.GrowingRegPruner):
@@ -186,6 +201,7 @@ def sparsity_learning(model, pruner, train_loader, args, logger, device):
 
 def finetune(model, train_loader, val_loader, args, logger, device):
     """Finetune the pruned model to recover accuracy."""
+    criterion = build_criterion(args, device)
     optimizer = torch.optim.SGD(
         model.parameters(), lr=args.finetune_lr, momentum=0.9,
         weight_decay=args.weight_decay,
@@ -201,16 +217,17 @@ def finetune(model, train_loader, val_loader, args, logger, device):
             images, masks = images.to(device), masks.to(device)
             optimizer.zero_grad()
             output = model(images)
-            loss = F.cross_entropy(output["out"], masks, ignore_index=255)
+            loss, loss_dict = criterion(output["out"], masks)
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
 
             if (i + 1) % args.log_interval == 0:
+                loss_info = " ".join(f"{k}={v:.4f}" for k, v in loss_dict.items())
                 logger.info(
-                    "  [Finetune] Epoch [%d/%d] Iter [%d/%d] Loss: %.4f LR: %.6f",
+                    "  [Finetune] Epoch [%d/%d] Iter [%d/%d] Loss: %.4f (%s) LR: %.6f",
                     epoch + 1, args.finetune_epochs, i + 1, len(train_loader),
-                    running_loss / (i + 1), optimizer.param_groups[0]["lr"],
+                    running_loss / (i + 1), loss_info, optimizer.param_groups[0]["lr"],
                 )
         scheduler.step()
 
@@ -274,6 +291,14 @@ def main():
     parser.add_argument("--sl-epochs", type=int, default=100)
     parser.add_argument("--sl-lr", type=float, default=0.005)
     parser.add_argument("--sl-lr-decay-milestones", type=str, default="60,80")
+
+    # Loss weights (multi-loss: CE + Edge + Lovász)
+    parser.add_argument("--ce-weight", type=float, default=1.0,
+                        help="Weight for cross-entropy loss (default: 1.0)")
+    parser.add_argument("--edge-weight", type=float, default=0.0,
+                        help="Weight for edge loss; 0 to disable (default: 0.0)")
+    parser.add_argument("--lovasz-weight", type=float, default=0.0,
+                        help="Weight for Lovász-Softmax IoU loss; 0 to disable (default: 0.0)")
 
     # Finetuning
     parser.add_argument("--finetune", action="store_true")

@@ -39,6 +39,8 @@ from torchvision.models.segmentation import (
     lraspp_mobilenet_v3_large,
 )
 
+from losses import MultiSegLoss
+
 # =====================================================
 # Preset Models (backward compatibility)
 # =====================================================
@@ -618,6 +620,17 @@ def train(args):
     else:
         logger.info("Model: %s (preset)", args.model)
 
+    # Loss function
+    criterion = MultiSegLoss(
+        num_classes=args.num_classes,
+        ce_weight=args.ce_weight,
+        edge_weight=args.edge_weight,
+        lovasz_weight=args.lovasz_weight,
+        ignore_index=255,
+    ).to(device)
+    logger.info("Loss weights: CE=%.2f, Edge=%.2f, Lovász=%.2f",
+                args.ce_weight, args.edge_weight, args.lovasz_weight)
+
     # Optimizer
     optimizer = torch.optim.SGD(
         model.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay,
@@ -634,18 +647,20 @@ def train(args):
             images, masks = images.to(device), masks.to(device)
             optimizer.zero_grad()
             output = model(images)
-            loss = F.cross_entropy(output["out"], masks, ignore_index=255)
+            loss, loss_dict = criterion(output["out"], masks)
             if "aux" in output and output["aux"] is not None and args.aux_loss:
-                loss += 0.4 * F.cross_entropy(output["aux"], masks, ignore_index=255)
+                aux_ce = F.cross_entropy(output["aux"], masks, ignore_index=255)
+                loss = loss + 0.4 * aux_ce
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
 
             if (i + 1) % args.log_interval == 0:
+                loss_info = " ".join(f"{k}={v:.4f}" for k, v in loss_dict.items())
                 logger.info(
-                    "Epoch [%d/%d] Iter [%d/%d] Loss: %.4f LR: %.6f",
+                    "Epoch [%d/%d] Iter [%d/%d] Loss: %.4f (%s) LR: %.6f",
                     epoch + 1, args.epochs, i + 1, len(train_loader),
-                    running_loss / (i + 1), optimizer.param_groups[0]["lr"],
+                    running_loss / (i + 1), loss_info, optimizer.param_groups[0]["lr"],
                 )
         scheduler.step()
 
@@ -710,6 +725,14 @@ if __name__ == "__main__":
                         help="Use auxiliary loss during training")
     parser.add_argument("--restore", type=str, default=None,
                         help="Path to checkpoint for resuming training")
+
+    # Loss weights (multi-loss: CE + Edge + Lovász)
+    parser.add_argument("--ce-weight", type=float, default=1.0,
+                        help="Weight for cross-entropy loss (default: 1.0)")
+    parser.add_argument("--edge-weight", type=float, default=0.0,
+                        help="Weight for edge loss; 0 to disable (default: 0.0)")
+    parser.add_argument("--lovasz-weight", type=float, default=0.0,
+                        help="Weight for Lovász-Softmax IoU loss; 0 to disable (default: 0.0)")
 
     # Training
     parser.add_argument("--epochs", type=int, default=100)
