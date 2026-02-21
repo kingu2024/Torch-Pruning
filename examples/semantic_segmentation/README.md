@@ -1,6 +1,10 @@
 # Semantic Segmentation: Training & Pruning
 
-This example demonstrates how to train and prune semantic segmentation models (DeepLabV3, FCN, LRASPP) using **Torch-Pruning**.
+This example demonstrates how to train and prune semantic segmentation models using **Torch-Pruning**.
+
+Two modes are supported:
+- **Modular mode**: freely compose your model from `backbone + neck + head`
+- **Preset mode**: use torchvision segmentation models directly (DeepLabV3, FCN, LRASPP)
 
 ## Dataset Structure
 
@@ -19,7 +23,22 @@ data_root/
 - Image and mask filenames must share the same stem (e.g., `001.jpg` and `001.png`).
 - Mask pixel values represent class indices. Use `255` for ignore/unlabeled regions.
 
-## Supported Models
+## Modular Architecture
+
+Build your segmentation model by combining any backbone, neck, and head:
+
+| Component | Options | Description |
+|-----------|---------|-------------|
+| **Backbone** | `resnet18`, `resnet34`, `resnet50`, `resnet101`, `resnet152` | ResNet family |
+| | `mobilenet_v2`, `mobilenet_v3_large`, `mobilenet_v3_small` | MobileNet family |
+| **Neck** | `fpn` | Feature Pyramid Network (multi-scale fusion) |
+| | `aspp` | Atrous Spatial Pyramid Pooling (DeepLabV3 style) |
+| | `ppm` | Pyramid Pooling Module (PSPNet style) |
+| | `identity` | Pass-through (no fusion, uses deepest feature) |
+| **Head** | `fcn` | Conv-BN-ReLU-Dropout-Conv |
+| | `simple` | Single 1x1 convolution |
+
+## Preset Models
 
 | Model | Key |
 |---|---|
@@ -48,6 +67,39 @@ data_root/
 
 ## Step 1: Training
 
+### Modular mode (recommended)
+
+```bash
+python train_seg.py \
+    --data-root /path/to/dataset \
+    --num-classes 21 \
+    --backbone resnet50 \
+    --neck fpn \
+    --head fcn \
+    --pretrained-backbone \
+    --epochs 100 \
+    --batch-size 8 \
+    --output-dir output/seg_train
+```
+
+Other combinations:
+
+```bash
+# DeepLab-style: ResNet101 + ASPP + FCN head
+python train_seg.py --data-root /data --num-classes 21 \
+    --backbone resnet101 --neck aspp --head fcn --pretrained-backbone
+
+# PSPNet-style: ResNet50 + PPM + FCN head
+python train_seg.py --data-root /data --num-classes 21 \
+    --backbone resnet50 --neck ppm --head fcn --pretrained-backbone
+
+# Lightweight: MobileNetV3 + FPN + simple head
+python train_seg.py --data-root /data --num-classes 21 \
+    --backbone mobilenet_v3_large --neck fpn --head simple --pretrained-backbone
+```
+
+### Preset mode (torchvision models)
+
 ```bash
 python train_seg.py \
     --data-root /path/to/dataset \
@@ -55,20 +107,18 @@ python train_seg.py \
     --model deeplabv3_resnet50 \
     --pretrained-backbone \
     --epochs 100 \
-    --batch-size 8 \
-    --lr 0.01 \
     --output-dir output/seg_train
 ```
 
 ## Step 2: Pruning
 
-### One-shot pruning (no sparsity learning)
+### Modular model
 
 ```bash
 python prune_seg.py \
     --data-root /path/to/dataset \
     --num-classes 21 \
-    --model deeplabv3_resnet50 \
+    --backbone resnet50 --neck fpn --head fcn \
     --restore output/seg_train/final_model.pth \
     --method l1 \
     --speed-up 2.0 \
@@ -78,7 +128,7 @@ python prune_seg.py \
     --output-dir output/seg_prune
 ```
 
-### Pruning with sparsity learning (e.g., group_norm)
+### Preset model
 
 ```bash
 python prune_seg.py \
@@ -88,10 +138,24 @@ python prune_seg.py \
     --restore output/seg_train/final_model.pth \
     --method group_norm \
     --speed-up 2.0 \
-    --sl-epochs 50 \
     --finetune \
     --finetune-epochs 50 \
     --output-dir output/seg_prune
+```
+
+### Pruning with sparsity learning (e.g., slim)
+
+```bash
+python prune_seg.py \
+    --data-root /path/to/dataset \
+    --num-classes 21 \
+    --backbone resnet50 --neck aspp --head fcn \
+    --restore output/seg_train/final_model.pth \
+    --method slim \
+    --speed-up 2.0 \
+    --sl-epochs 50 \
+    --finetune \
+    --finetune-epochs 50
 ```
 
 ## Output Files

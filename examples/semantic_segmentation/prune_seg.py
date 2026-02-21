@@ -4,7 +4,9 @@ Semantic Segmentation Pruning Script
 Prune a trained segmentation model using Torch-Pruning, with optional
 sparsity-learning regularization and post-pruning finetuning.
 
-Supports multiple pruning methods from the Torch-Pruning library:
+Supports both modular (backbone+neck+head) and preset torchvision models.
+
+Pruning methods:
     - l1 / l2           : Magnitude-based pruning
     - fpgm              : Filter Pruning via Geometric Median
     - lamp              : Layer-Adaptive Magnitude Pruning
@@ -15,26 +17,18 @@ Supports multiple pruning methods from the Torch-Pruning library:
     - random            : Random pruning (baseline)
     - taylor            : First-order Taylor expansion
 
-Dataset structure:
-    data_root/
-        images/    # original images (.jpg)
-        segs/      # segmentation masks (.png), pixel values = class indices
-
 Usage:
-    # One-shot pruning (magnitude-based)
-    python prune_seg.py --data-root /path/to/dataset --num-classes 21 \\
-        --model deeplabv3_resnet50 --restore output/seg_train/final_model.pth \\
+    # Modular model
+    python prune_seg.py --data-root /data --num-classes 21 \
+        --backbone resnet50 --neck fpn --head fcn \
+        --restore output/seg_train/final_model.pth \
         --method l1 --speed-up 2.0 --finetune --finetune-epochs 50
 
-    # Pruning with sparsity learning (group_norm)
-    python prune_seg.py --data-root /path/to/dataset --num-classes 21 \\
-        --model deeplabv3_resnet50 --restore output/seg_train/final_model.pth \\
+    # Preset model
+    python prune_seg.py --data-root /data --num-classes 21 \
+        --model deeplabv3_resnet50 \
+        --restore output/seg_train/final_model.pth \
         --method group_norm --speed-up 2.0 --finetune --finetune-epochs 50
-
-    # Pruning with BN scaling factor (slim, requires sparsity learning phase)
-    python prune_seg.py --data-root /path/to/dataset --num-classes 21 \\
-        --model deeplabv3_resnet50 --restore output/seg_train/final_model.pth \\
-        --method slim --speed-up 2.0 --sl-epochs 50 --finetune --finetune-epochs 50
 """
 
 import os
@@ -56,8 +50,10 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 import torch_pruning as tp
 
-# Reuse dataset and evaluation utilities from the training script
-from train_seg import SegDataset, evaluate, MODEL_DICT, compute_miou
+from train_seg import (
+    SegDataset, evaluate, compute_miou, build_model,
+    PRESET_MODELS, MODEL_DICT, BACKBONE_REGISTRY, NECK_REGISTRY, HEAD_REGISTRY,
+)
 
 
 def get_logger(name, log_file=None):
@@ -131,7 +127,7 @@ def get_pruner(model, example_inputs, args):
         example_inputs=example_inputs,
         importance=imp,
         iterative_steps=args.iterative_steps,
-        pruning_ratio=1.0,  # will be controlled by speed-up target
+        pruning_ratio=1.0,
         max_pruning_ratio=args.max_pruning_ratio,
         ignored_layers=ignored_layers,
         output_transform=lambda x: x["out"],
@@ -157,7 +153,7 @@ def sparsity_learning(model, pruner, train_loader, args, logger, device):
     """Run sparsity learning (regularization) phase before pruning."""
     optimizer = torch.optim.SGD(
         model.parameters(), lr=args.sl_lr, momentum=0.9,
-        weight_decay=0,  # weight decay handled by pruner regularization
+        weight_decay=0,
     )
     milestones = [int(ms) for ms in args.sl_lr_decay_milestones.split(",")]
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=0.1)
@@ -171,7 +167,7 @@ def sparsity_learning(model, pruner, train_loader, args, logger, device):
             output = model(images)
             loss = F.cross_entropy(output["out"], masks, ignore_index=255)
             loss.backward()
-            pruner.regularize(model)  # apply group sparsity regularization
+            pruner.regularize(model)
             optimizer.step()
 
             if (i + 1) % args.log_interval == 0:
@@ -243,9 +239,21 @@ def main():
     parser.add_argument("--image-size", type=int, default=512)
     parser.add_argument("--val-ratio", type=float, default=0.1)
 
-    # Model
-    parser.add_argument("--model", type=str, default="deeplabv3_resnet50",
-                        choices=list(MODEL_DICT.keys()))
+    # Model -- modular mode
+    parser.add_argument("--backbone", type=str, default=None,
+                        choices=list(BACKBONE_REGISTRY.keys()),
+                        help="Backbone network (enables modular mode)")
+    parser.add_argument("--neck", type=str, default="fpn",
+                        choices=NECK_REGISTRY)
+    parser.add_argument("--head", type=str, default="fcn",
+                        choices=HEAD_REGISTRY)
+    parser.add_argument("--neck-channels", type=int, default=256)
+
+    # Model -- preset mode
+    parser.add_argument("--model", type=str, default=None,
+                        choices=list(PRESET_MODELS.keys()))
+
+    # Restore
     parser.add_argument("--restore", type=str, required=True,
                         help="Path to trained model checkpoint (entire model .pth or state_dict)")
 
@@ -253,30 +261,22 @@ def main():
     parser.add_argument("--method", type=str, default="l1",
                         choices=["random", "l1", "l2", "fpgm", "lamp", "slim",
                                  "group_slim", "group_norm", "group_sl",
-                                 "growing_reg", "taylor"],
-                        help="Pruning method")
+                                 "growing_reg", "taylor"])
     parser.add_argument("--speed-up", type=float, default=2.0,
                         help="Target FLOPs speed-up ratio")
     parser.add_argument("--max-pruning-ratio", type=float, default=1.0)
-    parser.add_argument("--iterative-steps", type=int, default=400,
-                        help="Progressive pruning steps to reach target speed-up")
-    parser.add_argument("--global-pruning", action="store_true",
-                        help="Enable global pruning across all layers")
+    parser.add_argument("--iterative-steps", type=int, default=400)
+    parser.add_argument("--global-pruning", action="store_true")
 
     # Regularization (for sparsity-learning methods)
-    parser.add_argument("--reg", type=float, default=5e-4,
-                        help="Regularization coefficient for sparsity learning")
-    parser.add_argument("--delta-reg", type=float, default=1e-4,
-                        help="Delta regularization for growing_reg method")
-    parser.add_argument("--sl-epochs", type=int, default=100,
-                        help="Epochs for sparsity learning phase")
-    parser.add_argument("--sl-lr", type=float, default=0.005,
-                        help="Learning rate for sparsity learning")
+    parser.add_argument("--reg", type=float, default=5e-4)
+    parser.add_argument("--delta-reg", type=float, default=1e-4)
+    parser.add_argument("--sl-epochs", type=int, default=100)
+    parser.add_argument("--sl-lr", type=float, default=0.005)
     parser.add_argument("--sl-lr-decay-milestones", type=str, default="60,80")
 
     # Finetuning
-    parser.add_argument("--finetune", action="store_true",
-                        help="Finetune the model after pruning")
+    parser.add_argument("--finetune", action="store_true")
     parser.add_argument("--finetune-epochs", type=int, default=50)
     parser.add_argument("--finetune-lr", type=float, default=0.005)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -288,6 +288,10 @@ def main():
     parser.add_argument("--log-interval", type=int, default=10)
 
     args = parser.parse_args()
+
+    if args.backbone is None and args.model is None:
+        parser.error("Specify either --backbone (modular mode) or --model (preset mode)")
+
     os.makedirs(args.output_dir, exist_ok=True)
     logger = get_logger("prune_seg", log_file=os.path.join(args.output_dir, "prune.log"))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -321,11 +325,8 @@ def main():
     if isinstance(loaded, nn.Module):
         model = loaded
     else:
-        # state_dict: need to create model first
-        if args.model.startswith("lraspp"):
-            model = MODEL_DICT[args.model](num_classes=args.num_classes)
-        else:
-            model = MODEL_DICT[args.model](num_classes=args.num_classes, aux_loss=None)
+        # state_dict: rebuild the model architecture first
+        model = build_model(args)
         model.load_state_dict(loaded)
     model = model.to(device)
     model.eval()
@@ -362,7 +363,7 @@ def main():
     logger.info("Pruning with method=%s, target speed-up=%.1fx ...", args.method, args.speed_up)
     model.eval()
     actual_speedup = progressive_pruning(pruner, model, args.speed_up, example_inputs)
-    del pruner  # release pruner references
+    del pruner
 
     # =====================================================
     # 7. Evaluate after pruning
@@ -391,7 +392,6 @@ def main():
         logger.info("Starting finetuning for %d epochs...", args.finetune_epochs)
         finetune(model, train_loader, val_loader, args, logger, device)
 
-        # Final evaluation
         final_miou, final_loss = evaluate(model, val_loader, args.num_classes, device)
         logger.info("=" * 60)
         logger.info("After Finetuning:")
